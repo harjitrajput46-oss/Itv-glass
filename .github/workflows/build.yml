@@ -1,0 +1,449 @@
+name: Build IPTV-Glass APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Create project files
+        run: |
+          rm -rf proj && mkdir -p proj && cd proj
+          cat > settings.gradle << 'EOF_1'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "IPTVGlass"
+          include ':app'
+
+          EOF_1
+          cat > build.gradle << 'EOF_2'
+          plugins { id 'com.android.application' version '8.5.2' apply false }
+
+          EOF_2
+          cat > gradle.properties << 'EOF_3'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+
+          EOF_3
+          mkdir -p app
+          cat > app/build.gradle << 'EOF_4'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.iptv.glass'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.iptv.glass"
+                  minSdk 22
+                  targetSdk 28
+                  versionCode 1
+                  versionName "1.0"
+                  multiDexEnabled true
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+          dependencies {
+              implementation 'androidx.multidex:multidex:2.0.1'
+              implementation 'com.google.android.exoplayer:exoplayer-core:2.18.7'
+              implementation 'com.google.android.exoplayer:exoplayer-ui:2.18.7'
+              implementation 'com.google.android.exoplayer:exoplayer-hls:2.18.7'
+          }
+
+          EOF_4
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml << 'EOF_5'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+              <uses-feature android:name="android.software.leanback" android:required="false"/>
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false"/>
+              <application
+                  android:name="androidx.multidex.MultiDexApplication"
+                  android:label="IPTV Glass"
+                  android:allowBackup="false"
+                  android:usesCleartextTraffic="true"
+                  android:hardwareAccelerated="true"
+                  android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="landscape"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                          <category android:name="android.intent.category.LEANBACK_LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <activity
+                      android:name=".PlayerActivity"
+                      android:exported="false"
+                      android:screenOrientation="landscape"
+                      android:configChanges="orientation|screenSize|keyboardHidden"/>
+              </application>
+          </manifest>
+
+          EOF_5
+          mkdir -p app/src/main/java/com/iptv/glass
+          cat > app/src/main/java/com/iptv/glass/Channel.java << 'EOF_6'
+          package com.iptv.glass;
+
+          public class Channel {
+              public String name;
+              public String url;
+              public String group;
+              public Channel(String n, String u, String g) { name = n; url = u; group = g; }
+          }
+
+          EOF_6
+          mkdir -p app/src/main/java/com/iptv/glass
+          cat > app/src/main/java/com/iptv/glass/M3UParser.java << 'EOF_7'
+          package com.iptv.glass;
+
+          import java.io.BufferedReader;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class M3UParser {
+
+              public static List<Channel> load(String link) throws Exception {
+                  HttpURLConnection c = (HttpURLConnection) new URL(link).openConnection();
+                  c.setConnectTimeout(15000);
+                  c.setReadTimeout(30000);
+                  c.setRequestProperty("User-Agent", "Mozilla/5.0");
+                  c.setInstanceFollowRedirects(true);
+                  InputStream in = c.getInputStream();
+                  BufferedReader br = new BufferedReader(new InputStreamReader(in, "UTF-8"));
+                  List<Channel> out = new ArrayList<Channel>();
+                  String line, name = null, group = "Other";
+                  while ((line = br.readLine()) != null) {
+                      line = line.trim();
+                      if (line.length() == 0) continue;
+                      if (line.startsWith("#EXTINF")) {
+                          int comma = line.lastIndexOf(',');
+                          name = comma >= 0 ? line.substring(comma + 1).trim() : "Channel";
+                          group = "Other";
+                          int g = line.indexOf("group-title=\"");
+                          if (g >= 0) {
+                              int s = g + 13;
+                              int e = line.indexOf('"', s);
+                              if (e > s) group = line.substring(s, e);
+                          }
+                      } else if (!line.startsWith("#")) {
+                          if (name == null) name = line;
+                          out.add(new Channel(name, line, group));
+                          name = null;
+                      }
+                  }
+                  br.close();
+                  return out;
+              }
+          }
+
+          EOF_7
+          mkdir -p app/src/main/java/com/iptv/glass
+          cat > app/src/main/java/com/iptv/glass/PlayerActivity.java << 'EOF_8'
+          package com.iptv.glass;
+
+          import android.app.Activity;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.view.KeyEvent;
+          import android.view.WindowManager;
+          import com.google.android.exoplayer2.ExoPlayer;
+          import com.google.android.exoplayer2.MediaItem;
+          import com.google.android.exoplayer2.ui.StyledPlayerView;
+
+          public class PlayerActivity extends Activity {
+              private ExoPlayer player;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  StyledPlayerView v = new StyledPlayerView(this);
+                  v.setBackgroundColor(0xFF000000);
+                  setContentView(v);
+                  player = new ExoPlayer.Builder(this).build();
+                  v.setPlayer(player);
+                  player.setMediaItem(MediaItem.fromUri(Uri.parse(getIntent().getStringExtra("url"))));
+                  player.prepare();
+                  player.setPlayWhenReady(true);
+              }
+
+              @Override
+              public boolean onKeyDown(int k, KeyEvent e) {
+                  if (k == KeyEvent.KEYCODE_BACK) { finish(); return true; }
+                  return super.onKeyDown(k, e);
+              }
+
+              @Override
+              protected void onStop() {
+                  super.onStop();
+                  if (player != null) { player.release(); player = null; }
+                  finish();
+              }
+          }
+
+          EOF_8
+          mkdir -p app/src/main/java/com/iptv/glass
+          cat > app/src/main/java/com/iptv/glass/MainActivity.java << 'EOF_9'
+          package com.iptv.glass;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.graphics.Color;
+          import android.graphics.drawable.GradientDrawable;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.text.InputType;
+          import android.view.Gravity;
+          import android.view.KeyEvent;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.AdapterView;
+          import android.widget.ArrayAdapter;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ListView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import java.text.SimpleDateFormat;
+          import java.util.ArrayList;
+          import java.util.Date;
+          import java.util.LinkedHashSet;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Set;
+
+          public class MainActivity extends Activity {
+
+              private static final String DEFAULT_URL = "https://iptv-org.github.io/iptv/languages/hin.m3u";
+
+              private List<Channel> all = new ArrayList<Channel>();
+              private List<Channel> shown = new ArrayList<Channel>();
+              private List<String> groups = new ArrayList<String>();
+              private ListView groupList, chanList;
+              private ArrayAdapter<String> gAdapter, cAdapter;
+              private TextView status, clock, bigTitle;
+              private EditText urlBox;
+              private SharedPreferences prefs;
+              private Handler ui = new Handler(Looper.getMainLooper());
+
+              private GradientDrawable glass(int radiusDp, int topAlpha, int botAlpha, boolean border) {
+                  GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                          new int[]{Color.argb(topAlpha, 255, 255, 255), Color.argb(botAlpha, 255, 255, 255)});
+                  g.setCornerRadius(radiusDp * getResources().getDisplayMetrics().density);
+                  if (border) g.setStroke(2, Color.argb(110, 255, 255, 255));
+                  return g;
+              }
+
+              private int dp(int v) { return (int) (v * getResources().getDisplayMetrics().density); }
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  prefs = getSharedPreferences("iptv", MODE_PRIVATE);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(dp(32), dp(20), dp(32), dp(20));
+                  GradientDrawable bg = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                          new int[]{0xFF1B1F3B, 0xFF3A2A6B, 0xFF0F3A5F});
+                  root.setBackgroundDrawable(bg);
+
+                  LinearLayout top = new LinearLayout(this);
+                  top.setOrientation(LinearLayout.HORIZONTAL);
+                  top.setGravity(Gravity.CENTER_VERTICAL);
+                  bigTitle = new TextView(this);
+                  bigTitle.setText("IPTV Glass");
+                  bigTitle.setTextColor(Color.WHITE);
+                  bigTitle.setTextSize(30);
+                  bigTitle.setTypeface(null, android.graphics.Typeface.BOLD);
+                  top.addView(bigTitle, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+                  clock = new TextView(this);
+                  clock.setTextColor(Color.WHITE);
+                  clock.setTextSize(18);
+                  clock.setPadding(dp(18), dp(8), dp(18), dp(8));
+                  clock.setBackgroundDrawable(glass(30, 70, 25, true));
+                  top.addView(clock);
+                  root.addView(top);
+
+                  LinearLayout bar = new LinearLayout(this);
+                  bar.setOrientation(LinearLayout.HORIZONTAL);
+                  bar.setGravity(Gravity.CENTER_VERTICAL);
+                  bar.setPadding(0, dp(12), 0, dp(12));
+                  urlBox = new EditText(this);
+                  urlBox.setSingleLine(true);
+                  urlBox.setInputType(InputType.TYPE_TEXT_VARIATION_URI);
+                  urlBox.setTextColor(Color.WHITE);
+                  urlBox.setHintTextColor(0x99FFFFFF);
+                  urlBox.setHint("M3U playlist link yahan daalein");
+                  urlBox.setTextSize(15);
+                  urlBox.setText(prefs.getString("url", DEFAULT_URL));
+                  urlBox.setBackgroundDrawable(glass(14, 60, 20, true));
+                  urlBox.setPadding(dp(16), dp(10), dp(16), dp(10));
+                  bar.addView(urlBox, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+                  Button load = new Button(this);
+                  load.setText("Load");
+                  load.setTextColor(Color.WHITE);
+                  load.setBackgroundDrawable(glass(14, 110, 50, true));
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                  lp.leftMargin = dp(12);
+                  bar.addView(load, lp);
+                  root.addView(bar);
+
+                  status = new TextView(this);
+                  status.setTextColor(0xCCFFFFFF);
+                  status.setTextSize(14);
+                  status.setPadding(dp(4), 0, 0, dp(8));
+                  root.addView(status);
+
+                  LinearLayout body = new LinearLayout(this);
+                  body.setOrientation(LinearLayout.HORIZONTAL);
+                  groupList = new ListView(this);
+                  chanList = new ListView(this);
+                  for (ListView lv : new ListView[]{groupList, chanList}) {
+                      lv.setDivider(null);
+                      lv.setSelector(glass(14, 120, 60, true));
+                      lv.setPadding(dp(8), dp(8), dp(8), dp(8));
+                      lv.setClipToPadding(false);
+                      lv.setBackgroundDrawable(glass(22, 45, 15, true));
+                  }
+                  LinearLayout.LayoutParams gl = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1);
+                  gl.rightMargin = dp(16);
+                  LinearLayout.LayoutParams cl = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 2);
+                  body.addView(groupList, gl);
+                  body.addView(chanList, cl);
+                  root.addView(body, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
+                  setContentView(root);
+
+                  gAdapter = makeAdapter();
+                  cAdapter = makeAdapter();
+                  groupList.setAdapter(gAdapter);
+                  chanList.setAdapter(cAdapter);
+
+                  groupList.setOnItemClickListener(new AdapterView.OnItemClickListener() {
+                      public void onItemClick(AdapterView<?> p, View v, int pos, long id) { showGroup(pos); chanList.requestFocus(); }
+                  });
+                  groupList.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+                      public void onItemSelected(AdapterView<?> p, View v, int pos, long id) { showGroup(pos); }
+                      public void onNothingSelected(AdapterView<?> p) {}
+                  });
+                  chanList.setOnItemClickListener(new AdapterView.OnItemClickListener() {
+                      public void onItemClick(AdapterView<?> p, View v, int pos, long id) {
+                          Intent i = new Intent(MainActivity.this, PlayerActivity.class);
+                          i.putExtra("url", shown.get(pos).url);
+                          startActivity(i);
+                      }
+                  });
+                  load.setOnClickListener(new View.OnClickListener() {
+                      public void onClick(View v) { loadPlaylist(urlBox.getText().toString().trim()); }
+                  });
+
+                  tick();
+                  loadPlaylist(urlBox.getText().toString().trim());
+                  groupList.requestFocus();
+              }
+
+              private ArrayAdapter<String> makeAdapter() {
+                  return new ArrayAdapter<String>(this, android.R.layout.simple_list_item_1, new ArrayList<String>()) {
+                      @Override
+                      public View getView(int position, View convertView, ViewGroup parent) {
+                          TextView t = (TextView) super.getView(position, convertView, parent);
+                          t.setTextColor(Color.WHITE);
+                          t.setTextSize(18);
+                          t.setSingleLine(true);
+                          t.setPadding(dp(18), dp(12), dp(18), dp(12));
+                          return t;
+                      }
+                  };
+              }
+
+              private void tick() {
+                  clock.setText(new SimpleDateFormat("hh:mm a", Locale.getDefault()).format(new Date()));
+                  ui.postDelayed(new Runnable() { public void run() { tick(); } }, 20000);
+              }
+
+              private void loadPlaylist(final String link) {
+                  if (link.length() == 0) { Toast.makeText(this, "Link khali hai", Toast.LENGTH_SHORT).show(); return; }
+                  prefs.edit().putString("url", link).apply();
+                  status.setText("Playlist load ho rahi hai...");
+                  new Thread(new Runnable() {
+                      public void run() {
+                          try {
+                              final List<Channel> list = M3UParser.load(link);
+                              ui.post(new Runnable() { public void run() { onLoaded(list); } });
+                          } catch (final Exception e) {
+                              ui.post(new Runnable() { public void run() { status.setText("Error: " + e.getMessage()); } });
+                          }
+                      }
+                  }).start();
+              }
+
+              private void onLoaded(List<Channel> list) {
+                  all = list;
+                  Set<String> g = new LinkedHashSet<String>();
+                  g.add("All");
+                  for (Channel c : all) g.add(c.group);
+                  groups = new ArrayList<String>(g);
+                  gAdapter.clear();
+                  gAdapter.addAll(groups);
+                  gAdapter.notifyDataSetChanged();
+                  status.setText(all.size() + " channels mile");
+                  showGroup(0);
+                  groupList.requestFocus();
+              }
+
+              private void showGroup(int pos) {
+                  if (pos < 0 || pos >= groups.size()) return;
+                  String g = groups.get(pos);
+                  shown = new ArrayList<Channel>();
+                  List<String> names = new ArrayList<String>();
+                  for (Channel c : all) {
+                      if (g.equals("All") || g.equals(c.group)) { shown.add(c); names.add(c.name); }
+                  }
+                  cAdapter.clear();
+                  cAdapter.addAll(names);
+                  cAdapter.notifyDataSetChanged();
+                  bigTitle.setText(g.equals("All") ? "IPTV Glass" : g);
+              }
+
+              @Override
+              public boolean onKeyDown(int k, KeyEvent e) {
+                  if (k == KeyEvent.KEYCODE_DPAD_RIGHT && groupList.hasFocus()) { chanList.requestFocus(); return true; }
+                  if (k == KeyEvent.KEYCODE_DPAD_LEFT && chanList.hasFocus()) { groupList.requestFocus(); return true; }
+                  return super.onKeyDown(k, e)
+                          ;
+              }
+          }
+
+          EOF_9
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+        working-directory: proj
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IPTVGlass-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
